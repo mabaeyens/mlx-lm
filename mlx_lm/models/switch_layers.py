@@ -1,12 +1,64 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .activations import swiglu
+
+# Default cap on experts materialized in one temporary stack, independent of
+# resident_expert_fraction (see _offload_enable's docstring for why this must
+# NOT scale with resident_slots). 76 (resident_expert_fraction=0.3 on
+# Qwen3.6's 256 experts) completed a ~1458-token worst-case prefill without
+# incident; 128 (fraction=0.5) hit a real Metal OOM — 64 leaves real margin
+# below the observed failure point while still bounding well below a "nearly
+# the whole table" chunk at any fraction.
+_OFFLOAD_DEFAULT_MAX_STACK = 64
+
+_OFFLOAD_EXECUTOR = None
+
+
+def _offload_executor():
+    """Lazily-created thread pool shared across every offload-enabled
+    SwitchLinear/QuantizedSwitchLinear (one per process, not one per module —
+    a model has ~120 of these, no reason to pay 120 pools' worth of thread
+    overhead). 8 workers: disk I/O bound work, not CPU bound, so this is
+    about overlapping blocking read() calls, not matching core count."""
+    global _OFFLOAD_EXECUTOR
+    if _OFFLOAD_EXECUTOR is None:
+        _OFFLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="mira-expert-fetch")
+    return _OFFLOAD_EXECUTOR
+
+
+def _offload_to_mx(raw):
+    """Convert one fetch_fn() result slot to an mx.array. Must run on the
+    same thread the resulting array will be used on — MLX streams are
+    thread-local, and mira-mlx's engine pins model execution to one
+    dedicated thread, so an mx.array constructed on a ThreadPoolExecutor
+    worker thread crashes the first time it's used here
+    ("RuntimeError: There is no Stream(gpu, N) in current thread", a real
+    crash hit during Phase C validation — every fetch_fn call used to build
+    its own mx.array directly, inside the worker thread). This is why
+    fetch_fn (core/inference/disk_expert_cache.py, mira-core) returns raw
+    (np.ndarray, dtype_str) instead: the parallel part (disk I/O + numpy) is
+    thread-safe, only this conversion isn't."""
+    if raw is None:
+        return None
+    np_array, dtype_str = raw
+    arr = mx.array(np_array)
+    if dtype_str == "BF16":
+        arr = arr.view(mx.bfloat16)
+    return arr
+
+
+def _offload_fetched_to_data(raw, quantized: bool):
+    if quantized:
+        w_raw, s_raw, b_raw = raw
+        return (_offload_to_mx(w_raw), _offload_to_mx(s_raw), _offload_to_mx(b_raw))
+    return _offload_to_mx(raw)
 
 
 def _gather_sort(x, indices):
@@ -43,18 +95,27 @@ def _offload_enable(module, resident_slots: int, fetch_fn, quantized: bool, max_
     dict cache there are no shared slots to collide over, so this can't
     happen.
 
-    `max_stack_size` (default: `resident_slots`) bounds how many experts'
-    weights `_offload_chunked_gather` is allowed to materialize into one
-    temporary stacked tensor at once. Without this bound, a call whose
-    unique-expert count is large — e.g. a long prefill, where
-    tokens_in_call * top_k routinely exceeds num_experts, so nearly every
-    expert gets touched in one call regardless of how skewed steady-state
-    routing is — builds one huge temporary stack covering nearly the whole
-    expert table, which is what caused a real Metal
+    `max_stack_size` (default: `min(resident_slots, _OFFLOAD_DEFAULT_MAX_STACK)`)
+    bounds how many experts' weights `_offload_chunked_gather` is allowed to
+    materialize into one temporary stacked tensor at once. Without this
+    bound, a call whose unique-expert count is large — e.g. a long prefill,
+    where tokens_in_call * top_k routinely exceeds num_experts, so nearly
+    every expert gets touched in one call regardless of how skewed
+    steady-state routing is — builds one huge temporary stack covering
+    nearly the whole expert table, which is what caused a real Metal
     kIOGPUCommandBufferCallbackErrorOutOfMemory crash under a ~1458-token
     prompt (specs/moe-expert-offload-02-runtime-cache.md, Phase C). Chunking
     keeps every call's peak transient memory bounded regardless of call
     shape, with no prefill/decode signal needed from the caller.
+
+    The default deliberately does NOT scale with resident_slots (i.e. isn't
+    just `resident_slots` itself): a first version of this fix used exactly
+    that and still crashed with the same OOM at resident_expert_fraction=0.5
+    (resident_slots=128 there → chunks of ~128, nearly half the expert
+    table again) — the whole point of a bound is that it has to hold
+    independent of how generous the residency setting is, not shrink or
+    grow with it. `_OFFLOAD_DEFAULT_MAX_STACK` is a fixed cap instead;
+    callers that know their own headroom can still override it explicitly.
     """
     n_experts = module.num_experts
     if resident_slots >= n_experts:
@@ -72,7 +133,9 @@ def _offload_enable(module, resident_slots: int, fetch_fn, quantized: bool, max_
     module._offload_fetch = fetch_fn
     module._offload_quantized = quantized
     module._offload_capacity = resident_slots
-    module._offload_max_stack_size = max(max_stack_size or resident_slots, 1)
+    module._offload_max_stack_size = max(
+        max_stack_size if max_stack_size is not None else min(resident_slots, _OFFLOAD_DEFAULT_MAX_STACK), 1
+    )
     module._offload_cache = {}
     module._offload_lru = []
     for e in range(resident_slots):
@@ -148,16 +211,28 @@ def _offload_chunked_gather(module, x, indices, gather_fn):
     cache = module._offload_cache
     result = None
     for gi, group in enumerate(groups):
+        missing = [e for e in group if e not in cache]
+        module._offload_hits += len(group) - len(missing)
+        module._offload_misses += len(missing)
+        if missing:
+            # Concurrent, not sequential: each fetch is a blocking disk
+            # read (~0.3-0.6ms measured against the real Qwen3.6 shards),
+            # but a large/diverse call can have tens of thousands of misses
+            # in one forward pass — sequential reads there dominate wall
+            # time far more than the chunking's extra matmul work does.
+            # Each fetch opens its own file handle and only reads
+            # already-resolved (read-only after setup) shard/offset
+            # metadata, so concurrent calls need no locking. fetch_fn
+            # returns raw (numpy, dtype) data, not mx.array — the actual
+            # mx.array construction happens right after, back on THIS
+            # thread (see _offload_to_mx's docstring for why that split is
+            # required, not optional).
+            raw_fetched = list(_offload_executor().map(module._offload_fetch, missing))
+            for e, raw in zip(missing, raw_fetched):
+                cache[e] = _offload_fetched_to_data(raw, module._offload_quantized)
         rows = []
         for e in group:
-            data = cache.get(e)
-            if data is not None:
-                module._offload_hits += 1
-            else:
-                module._offload_misses += 1
-                data = module._offload_fetch(e)
-                cache[e] = data
-            rows.append(data)
+            rows.append(cache[e])
             _offload_touch(module, e)
         stacked = _offload_stack_rows(rows, module._offload_quantized)
 
