@@ -120,16 +120,6 @@ def _offload_enable(module, resident_slots: int, fetch_fn, quantized: bool, max_
     n_experts = module.num_experts
     if resident_slots >= n_experts:
         return
-    # Seed the cache from experts already resident in the eager-loaded
-    # tensors (no wasted first-call fetches), then drop the reference to the
-    # full-size tensors so that unified memory is actually freed.
-    seed_weight = module.weight[:resident_slots]
-    seed_scales = module.scales[:resident_slots] if quantized else None
-    seed_biases = (
-        module.biases[:resident_slots] if quantized and module.get("biases") is not None else None
-    )
-    mx.eval(*(t for t in (seed_weight, seed_scales, seed_biases) if t is not None))
-
     module._offload_fetch = fetch_fn
     module._offload_quantized = quantized
     module._offload_capacity = resident_slots
@@ -138,18 +128,49 @@ def _offload_enable(module, resident_slots: int, fetch_fn, quantized: bool, max_
     )
     module._offload_cache = {}
     module._offload_lru = []
-    for e in range(resident_slots):
-        data = (seed_weight[e], seed_scales[e], seed_biases[e] if seed_biases is not None else None) if quantized else seed_weight[e]
-        module._offload_cache[e] = data
+    # True expert count, stashed because the 1-row stand-in installed below
+    # can no longer carry it in weight.shape[0] (see the num_experts property).
+    module._offload_num_experts = n_experts
+
+    # Seed the resident set by FETCHING FROM DISK, not by slicing the
+    # eager-loaded tensor. `module.weight[:resident_slots]` is an mx *view*
+    # that pins the ENTIRE parent buffer for as long as it lives — verified
+    # directly: allocate (256, 1024, 1024), slice [:32], drop the parent, and 0
+    # bytes free until the slice itself is dropped too. So the previous
+    # `module.weight = module.weight[:resident_slots]` never released the other
+    # experts at all — it kept the whole table resident and offload merely
+    # piled cache + temp-stack memory on top, which is exactly why peak memory
+    # exceeded the full-resident baseline at every fraction (spec Phase C
+    # "still-open gap"). Experts fetched through the same disk path a cold miss
+    # uses are genuinely independent buffers, so once they seed the cache the
+    # full-size eager tensors have no remaining reference and are freed.
+    seed_ids = list(range(resident_slots))
+    raw_seed = list(_offload_executor().map(fetch_fn, seed_ids))
+    for e, raw in zip(seed_ids, raw_seed):
+        module._offload_cache[e] = _offload_fetched_to_data(raw, quantized)
         module._offload_lru.append(e)
+
+    # Replace the full-size eager tensors with a 1-row stand-in (a view of a
+    # now-resident expert) so input_dims/output_dims keep resolving and the
+    # parameter tree stays intact, WITHOUT holding the other experts. Assigning
+    # here drops the last reference to the full-size tensors, which is what
+    # actually frees them. The stand-in pins exactly one expert's worth of
+    # bytes and is never read for compute — the offload __call__ path reads
+    # only the cache, never module.weight/scales/biases.
+    seed0 = module._offload_cache[0]
+    if quantized:
+        w0, s0, b0 = seed0
+        module.weight = mx.expand_dims(w0, 0)
+        module.scales = mx.expand_dims(s0, 0)
+        if b0 is not None:
+            module.biases = mx.expand_dims(b0, 0)
+        mx.eval(module.weight, module.scales)
+    else:
+        module.weight = mx.expand_dims(seed0, 0)
+        mx.eval(module.weight)
+
     module._offload_hits = 0
     module._offload_misses = 0
-
-    module.weight = seed_weight
-    if quantized:
-        module.scales = seed_scales
-        if seed_biases is not None:
-            module.biases = seed_biases
 
 
 def _offload_touch(module, expert_id):
@@ -307,7 +328,11 @@ class QuantizedSwitchLinear(nn.Module):
 
     @property
     def num_experts(self):
-        return self.weight.shape[0]
+        # After enable_offload the full weight is replaced by a 1-row stand-in,
+        # so shape[0] no longer reflects the true expert count; the real value
+        # is stashed on the module (offload path only; unset otherwise).
+        n = getattr(self, "_offload_num_experts", None)
+        return n if n is not None else self.weight.shape[0]
 
     def enable_offload(self, resident_slots: int, fetch_fn, max_stack_size=None):
         _offload_enable(self, resident_slots, fetch_fn, quantized=True, max_stack_size=max_stack_size)
@@ -373,7 +398,10 @@ class SwitchLinear(nn.Module):
 
     @property
     def num_experts(self):
-        return self.weight.shape[0]
+        # See QuantizedSwitchLinear.num_experts: offload swaps the full weight
+        # for a 1-row stand-in, so the true count is stashed on the module.
+        n = getattr(self, "_offload_num_experts", None)
+        return n if n is not None else self.weight.shape[0]
 
     def enable_offload(self, resident_slots: int, fetch_fn, max_stack_size=None):
         _offload_enable(self, resident_slots, fetch_fn, quantized=False, max_stack_size=max_stack_size)
