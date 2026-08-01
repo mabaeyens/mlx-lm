@@ -1072,6 +1072,30 @@ class TestGenerate(unittest.TestCase):
             ),
         )
 
+    def test_embed_tokens_walks_nested_wrappers(self):
+        """Qwen1.5 keeps the table at model.model.embed_tokens; Qwen3.5's
+        multimodal wrapper keeps it at language_model.model.embed_tokens. The
+        lookup has to find both, and say so clearly when there is none."""
+        from mlx_lm.generate import _embed_tokens
+
+        toks = mx.array(self.tokenizer.encode("hello"))
+        direct = self.model.model.embed_tokens(toks)
+        self.assertTrue(mx.array_equal(_embed_tokens(self.model, toks), direct))
+
+        class Wrapper:
+            def __init__(self, inner):
+                self.language_model = inner
+
+        self.assertTrue(
+            mx.array_equal(_embed_tokens(Wrapper(self.model), toks), direct)
+        )
+
+        class Empty:
+            pass
+
+        with self.assertRaises(ValueError):
+            _embed_tokens(Empty(), toks)
+
     def test_input_embeddings_length_mismatch_raises(self):
         prompt = self.tokenizer.encode("The capital of France is")
         with self.assertRaises(ValueError):

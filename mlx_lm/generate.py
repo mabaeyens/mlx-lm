@@ -834,11 +834,23 @@ def _embed_tokens(model, tokens):
     Needed when only some sequences in a batch carry image embeddings: the rest
     have to be turned into embeddings too, so the whole batch can go through the
     one `input_embeddings` path instead of splitting into two forward calls.
+
+    Where the table sits varies by architecture: `model.model.embed_tokens` on
+    Qwen1.5, `model.language_model.model.embed_tokens` on Qwen3.5's multimodal
+    wrapper. Walk the usual container attributes rather than hardcoding either.
     """
-    for holder in (getattr(model, "model", None), model):
+    seen = set()
+    queue = [model]
+    while queue:
+        holder = queue.pop(0)
+        if holder is None or id(holder) in seen:
+            continue
+        seen.add(id(holder))
         embed = getattr(holder, "embed_tokens", None)
         if embed is not None:
             return embed(tokens)
+        for attr in ("model", "language_model", "transformer"):
+            queue.append(getattr(holder, attr, None))
     raise ValueError(
         f"{type(model).__name__} exposes no embed_tokens, so input embeddings "
         "cannot be mixed with plain token sequences in one batch."
