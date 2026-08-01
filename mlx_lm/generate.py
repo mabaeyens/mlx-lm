@@ -811,6 +811,40 @@ def _right_pad_prompts(prompts, max_length=None):
     return mx.array([p + [0] * (max_length - len(p)) for p in prompts])
 
 
+def _right_pad_embeddings(embeddings, max_length):
+    """Right pad a list of (length, hidden) arrays into one (batch, max_length, hidden).
+
+    Mirrors `_right_pad_prompts` so a batch carrying input embeddings pads
+    identically to one carrying token ids. Padding rows are zeros; the cache's
+    own `prepare`/`finalize` is what stops them from being attended to, exactly
+    as it does for the zero token ids on the text path.
+    """
+    padded = []
+    for e in embeddings:
+        pad = max_length - e.shape[0]
+        if pad > 0:
+            e = mx.concatenate([e, mx.zeros((pad, e.shape[1]), dtype=e.dtype)], axis=0)
+        padded.append(e)
+    return mx.stack(padded, axis=0)
+
+
+def _embed_tokens(model, tokens):
+    """Look up the input embeddings for `tokens` using the model's own table.
+
+    Needed when only some sequences in a batch carry image embeddings: the rest
+    have to be turned into embeddings too, so the whole batch can go through the
+    one `input_embeddings` path instead of splitting into two forward calls.
+    """
+    for holder in (getattr(model, "model", None), model):
+        embed = getattr(holder, "embed_tokens", None)
+        if embed is not None:
+            return embed(tokens)
+    raise ValueError(
+        f"{type(model).__name__} exposes no embed_tokens, so input embeddings "
+        "cannot be mixed with plain token sequences in one batch."
+    )
+
+
 @dataclass
 class BatchStats:
     """
@@ -1121,15 +1155,41 @@ class PromptProcessingBatch:
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.state_machines = [self.state_machines[idx] for idx in keep]
 
-    def prompt(self, tokens: List[List[int]]):
+    def prompt(
+        self,
+        tokens: List[List[int]],
+        input_embeddings: Optional[List[Optional[mx.array]]] = None,
+    ):
         """
         Process prompt tokens through the model.
 
         Args:
             tokens: List of token sequences to process.
+            input_embeddings: Optional per-sequence embeddings to prefill with
+                instead of looking `tokens` up in the embedding table. Entries
+                may be None for sequences that are plain text; those are
+                embedded here so the whole batch takes one path. Each array is
+                (len(tokens[i]), hidden). This is how image content reaches the
+                batched path: the caller has already spliced vision-tower
+                output into the text embeddings at the image token positions.
         """
         if len(self.uids) != len(tokens):
             raise ValueError("The batch length doesn't match the number of inputs")
+
+        if input_embeddings is not None:
+            if len(input_embeddings) != len(tokens):
+                raise ValueError(
+                    "input_embeddings must have one entry per sequence "
+                    f"(got {len(input_embeddings)} for {len(tokens)} sequences)"
+                )
+            for i, (e, t) in enumerate(zip(input_embeddings, tokens)):
+                if e is not None and e.shape[0] != len(t):
+                    raise ValueError(
+                        f"input_embeddings[{i}] covers {e.shape[0]} positions but "
+                        f"its token sequence has {len(t)}"
+                    )
+            if all(e is None for e in input_embeddings):
+                input_embeddings = None
 
         if not tokens:
             return
@@ -1145,19 +1205,40 @@ class PromptProcessingBatch:
         padding = [max_length - l for l in lengths]
         max_padding = max(padding)
 
+        # Any sequence without its own embeddings gets them from the table, so
+        # a mixed batch still pads and prefills as a single uniform block.
+        embeddings = None
+        if input_embeddings is not None:
+            embeddings = [
+                e if e is not None else _embed_tokens(self.model, mx.array(t))
+                for e, t in zip(input_embeddings, tokens)
+            ]
+
         # Prepare the caches and inputs. Right pad if needed otherwise just
         # cast to array.
         if max_padding > 0:
             tokens = _right_pad_prompts(tokens, max_length=max_length)
+            if embeddings is not None:
+                embeddings = _right_pad_embeddings(embeddings, max_length)
             for c in self.prompt_cache:
                 c.prepare(lengths=lengths, right_padding=padding)
         else:
             tokens = mx.array(tokens)
+            if embeddings is not None:
+                embeddings = mx.stack(embeddings, axis=0)
 
         # Actual prompt processing loop
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
-            self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
+            if embeddings is None:
+                self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
+            else:
+                self.model(
+                    tokens[:, :n_to_process],
+                    cache=self.prompt_cache,
+                    input_embeddings=embeddings[:, :n_to_process],
+                )
+                embeddings = embeddings[:, n_to_process:]
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
@@ -1638,7 +1719,20 @@ class BatchGenerator:
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ] = None,
         state_machines: Optional[List[SequenceStateMachine]] = None,
+        input_embeddings: Optional[List[Optional[mx.array]]] = None,
     ):
+        """
+        Args:
+            input_embeddings: Optional per-sequence prompt embeddings, one
+                (total_prompt_tokens, hidden) array or None per sequence, where
+                total_prompt_tokens counts every token across that sequence's
+                segments. Supply this to prefill from embeddings rather than
+                from the embedding table, which is what multimodal input needs:
+                splice the vision tower's output into the text embeddings at the
+                image token positions and pass the result here. The final token
+                of a sequence still goes to generation as a token id, so it must
+                be a real text token, which it always is for a chat template.
+        """
         uids = []
 
         max_tokens = max_tokens or [self.max_tokens] * len(segments)
@@ -1650,6 +1744,7 @@ class BatchGenerator:
         state_machines = state_machines or (
             [self._default_state_machine] * len(segments)
         )
+        input_embeddings = input_embeddings or [None] * len(segments)
 
         caches = caches or [None] * len(segments)
         for i in range(len(segments)):
@@ -1671,7 +1766,7 @@ class BatchGenerator:
                     self.kv_bits,
                 )
 
-        for seq, m, c, at, s, lp, sm in zip(
+        for seq, m, c, at, s, lp, sm, emb in zip(
             segments,
             max_tokens,
             caches,
@@ -1679,13 +1774,21 @@ class BatchGenerator:
             samplers,
             logits_processors,
             state_machines,
+            input_embeddings,
         ):
             seq = list(seq)
+            if emb is not None:
+                total = sum(len(s_) for s_ in seq)
+                if emb.shape[0] != total:
+                    raise ValueError(
+                        f"input_embeddings covers {emb.shape[0]} positions but the "
+                        f"sequence has {total} prompt tokens"
+                    )
             if len(seq[-1]) != 1:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
             self._unprocessed_sequences.append(
-                (self._uid_count, seq, m, c, at, s, lp, sm)
+                (self._uid_count, seq, m, c, at, s, lp, sm, emb)
             )
             uids.append(self._uid_count)
             self._uid_count += 1
@@ -1798,8 +1901,10 @@ class BatchGenerator:
             logits_processors.append(sequence[6])
             max_tokens.append(sequence[2])
             state_machines.append(sequence[7])
+            # [segments, tokens_consumed, total_tokens, input_embeddings|None].
+            # tokens_consumed doubles as the row offset into the embeddings.
             self._currently_processing.append(
-                [sequence[1], 0, sum(len(s) for s in sequence[1])]
+                [sequence[1], 0, sum(len(s) for s in sequence[1]), sequence[8]]
             )
 
         return PromptProcessingBatch(
@@ -1869,6 +1974,7 @@ class BatchGenerator:
 
         # Extract the next prompts input
         prompts = []
+        prompt_embeddings = []
         for i, seq in enumerate(self._currently_processing):
             response = PromptProcessingBatch.Response(
                 self._prompt_batch.uids[i], 0, False, False
@@ -1876,6 +1982,13 @@ class BatchGenerator:
             segments = seq[0]
             n = min(len(segments[0]), self.prefill_step_size)
             prompts.append(segments[0][:n])
+            # Slice the embeddings in lockstep. seq[1] is how many tokens of
+            # this sequence have already been prefilled, which is exactly the
+            # row this chunk starts at.
+            if seq[3] is None:
+                prompt_embeddings.append(None)
+            else:
+                prompt_embeddings.append(seq[3][seq[1] : seq[1] + n])
             segments[0] = segments[0][n:]
             if len(segments[0]) == 0:
                 segments.pop(0)
@@ -1887,7 +2000,14 @@ class BatchGenerator:
         # Process the prompts
         self._prompt_tokens_counter += sum(len(p) for p in prompts)
         tic = time.perf_counter()
-        self._prompt_batch.prompt(prompts)
+        self._prompt_batch.prompt(
+            prompts,
+            input_embeddings=(
+                prompt_embeddings
+                if any(e is not None for e in prompt_embeddings)
+                else None
+            ),
+        )
         toc = time.perf_counter()
         self._prompt_time_counter += toc - tic
 

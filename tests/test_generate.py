@@ -407,7 +407,9 @@ class TestGenerate(unittest.TestCase):
 
         for uid in uids:
             self.assertGreater(
-                len(batch_responses[uid]), 0, "quantized+rotating job produced no tokens"
+                len(batch_responses[uid]),
+                0,
+                "quantized+rotating job produced no tokens",
             )
             for tok in batch_responses[uid]:
                 self.assertFalse(mx.isnan(mx.array(float(tok))))
@@ -1004,6 +1006,76 @@ class TestGenerate(unittest.TestCase):
             if r.finish_reason is not None:
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, KVCache)
+
+    def _embed(self, tokens):
+        holder = getattr(self.model, "model", self.model)
+        return holder.embed_tokens(mx.array(tokens))
+
+    def _batch_run(self, prompts, input_embeddings=None, **kwargs):
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=16,
+            **kwargs,
+        )
+        uids = gen.insert_segments(
+            [[p] for p in prompts], input_embeddings=input_embeddings
+        )
+        out = {u: [] for u in uids}
+        done = set()
+        while len(done) < len(uids):
+            for r in gen.next_generated():
+                if r.uid in done:
+                    continue
+                out[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    done.add(r.uid)
+        return [out[u] for u in uids]
+
+    def test_input_embeddings_match_token_prefill(self):
+        """Prefilling from embeddings looked up in the model's own table must be
+        token-identical to prefilling from the ids. This is the seam multimodal
+        input rides on, so if it drifts, nothing above it can be trusted."""
+        prompt = self.tokenizer.encode("The capital of France is")
+        self.assertEqual(
+            self._batch_run([prompt]),
+            self._batch_run([prompt], input_embeddings=[self._embed(prompt)]),
+        )
+
+    def test_input_embeddings_mixed_batch(self):
+        """One sequence with embeddings next to one without: the plain sequence
+        gets embedded here so the batch stays a single uniform forward."""
+        a = self.tokenizer.encode("The capital of France is")
+        b = self.tokenizer.encode("Water boils at a temperature of")
+        self.assertEqual(
+            self._batch_run([a, b]),
+            self._batch_run([a, b], input_embeddings=[self._embed(a), None]),
+        )
+
+    def test_input_embeddings_ragged_batch_right_padding(self):
+        a = self.tokenizer.encode("The capital of France is")
+        b = self.tokenizer.encode("Water boils at a temperature of")
+        self.assertNotEqual(len(a), len(b))
+        self.assertEqual(
+            self._batch_run([a, b]),
+            self._batch_run([a, b], input_embeddings=[self._embed(a), self._embed(b)]),
+        )
+
+    def test_input_embeddings_across_prefill_chunks(self):
+        """A prefill_step_size below the prompt length forces the slice loop, so
+        the embeddings have to advance in lockstep with the tokens."""
+        prompt = self.tokenizer.encode("The capital of France is")
+        self.assertEqual(
+            self._batch_run([prompt], prefill_step_size=4),
+            self._batch_run(
+                [prompt], input_embeddings=[self._embed(prompt)], prefill_step_size=4
+            ),
+        )
+
+    def test_input_embeddings_length_mismatch_raises(self):
+        prompt = self.tokenizer.encode("The capital of France is")
+        with self.assertRaises(ValueError):
+            self._batch_run([prompt], input_embeddings=[self._embed(prompt)[:-2]])
 
 
 if __name__ == "__main__":
