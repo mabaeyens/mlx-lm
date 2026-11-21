@@ -43,6 +43,7 @@ from .tokenizer_utils import load as _load_tokenizer
 
 # Constants
 MODEL_REMAPPING = {
+    "inkling2_loop": "inkling2",
     "mistral": "llama",
     "llava": "mistral3",
     "phi-msft": "phixtral",

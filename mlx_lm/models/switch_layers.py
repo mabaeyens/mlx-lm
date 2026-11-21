@@ -373,31 +373,57 @@ class QuantizedSwitchLinear(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         mode: str = "affine",
+        global_scale: bool = False,
     ):
         super().__init__()
-
-        scale = math.sqrt(1 / input_dims)
-        self.weight, self.scales, *biases = mx.quantize(
-            mx.random.uniform(
-                low=-scale,
-                high=scale,
-                shape=(num_experts, output_dims, input_dims),
-            ),
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-        )
-        self.biases = biases[0] if biases else None
-
-        if bias:
-            self.bias = mx.zeros((num_experts, output_dims))
 
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
 
+        scale = math.sqrt(1 / input_dims)
+        weight = mx.random.uniform(
+            low=-scale,
+            high=scale,
+            shape=(num_experts, output_dims, input_dims),
+        )
+        self._quantize(weight, global_scale)
+
+        if bias:
+            self.bias = mx.zeros((num_experts, output_dims))
+
         # Freeze this model's parameters
         self.freeze()
+
+    def _quantize(self, weight, global_scale=False):
+        """Quantize an (experts, out, in) weight; nvfp4 can carry a per-expert
+        tensor scale (`global_scale`), which Inkling 2's checkpoint uses."""
+        if global_scale:
+            if self.mode != "nvfp4":
+                raise ValueError(
+                    f"A global scale needs 'nvfp4' mode, got '{self.mode}'."
+                )
+            gs = mx.max(mx.abs(weight), axis=(-2, -1)).astype(mx.float32)
+            qs = [
+                mx.quantize(
+                    weight[e],
+                    self.group_size,
+                    self.bits,
+                    mode=self.mode,
+                    global_scale=gs[e],
+                )
+                for e in range(weight.shape[0])
+            ]
+            self.weight = mx.stack([q for q, _ in qs])
+            self.scales = mx.stack([s for _, s in qs])
+            self.biases = None
+            self.global_scale = gs
+        else:
+            self.weight, self.scales, *biases = mx.quantize(
+                weight, self.group_size, self.bits, mode=self.mode
+            )
+            self.biases = biases[0] if biases else None
+            self.global_scale = None
 
     @property
     def input_dims(self):
@@ -437,6 +463,10 @@ class QuantizedSwitchLinear(nn.Module):
 
             x = _offload_chunked_gather(self, x, indices, gather_fn, sorted_indices=sorted_indices)
         else:
+            # Only passed when set, so the regular path is untouched.
+            extra = {}
+            if self.get("global_scale") is not None:
+                extra["global_scale"] = self["global_scale"]
             x = mx.gather_qmm(
                 x,
                 self["weight"],
@@ -448,6 +478,7 @@ class QuantizedSwitchLinear(nn.Module):
                 bits=self.bits,
                 mode=self.mode,
                 sorted_indices=sorted_indices,
+                **extra,
             )
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
@@ -509,7 +540,13 @@ class SwitchLinear(nn.Module):
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):
+    def to_quantized(
+        self,
+        group_size: int = 64,
+        bits: int = 4,
+        mode: str = "affine",
+        global_scale: bool = False,
+    ):
         num_experts, output_dims, input_dims = self.weight.shape
         ql = QuantizedSwitchLinear(
             input_dims,
@@ -520,10 +557,7 @@ class SwitchLinear(nn.Module):
             bits,
             mode=mode,
         )
-        ql.weight, ql.scales, *biases = mx.quantize(
-            self.weight, group_size, bits, mode=mode
-        )
-        ql.biases = biases[0] if biases else None
+        ql._quantize(self.weight, global_scale)
 
         if "bias" in self:
             ql.bias = self.bias
