@@ -270,6 +270,16 @@ def _infer_thinking(tokenizer):
                 (vocab[think_end],),
             )
 
+    # Inkling 2: reasoning is a message of its own,
+    # <|message_model|><|content_thinking|> ... <|end_message|>.
+    if "<|content_thinking|>" in vocab and "<|end_message|>" in vocab:
+        return (
+            "<|content_thinking|>",
+            "<|end_message|>",
+            (vocab["<|content_thinking|>"],),
+            (vocab["<|end_message|>"],),
+        )
+
     # Multi token thinking modes
     if "<|channel>" in vocab and "<channel|>" in vocab:
         think_start = "<|channel>thought"
@@ -549,6 +559,8 @@ def _infer_tool_parser(chat_template):
     """Attempt to auto-infer a tool parser from the chat template."""
     if not isinstance(chat_template, str):
         return None
+    elif "<|content_invoke_tool_json|>" in chat_template:
+        return "inkling"
     elif "<minimax:tool_call>" in chat_template:
         return "minimax_m2"
     elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
